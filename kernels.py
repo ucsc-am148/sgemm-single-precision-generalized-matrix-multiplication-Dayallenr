@@ -185,7 +185,77 @@ def sgemm_1d_tile(A, B, C, M, N, K):
     Use cuda.local.array(TM4, float32) for the per-thread accumulator array.
     Initialize all entries to 0.0 before the K-loop.
     """
-    # TODO
+    # blockIdx.x = column tile index, blockIdx.y = row tile index
+    # 512 threads, each owns TM4=8 rows in one column of the output tile
+    # thread layout within the block: 512 = (BM4 / TM4) * BN4 = 8 * 64
+    # thread_col = tid % BN4       (0..63)
+    # thread_row = tid // BN4 * TM4  — starting row of this thread's strip
+ 
+    As = cuda.shared.array((BM4, BK4), float32)
+    Bs = cuda.shared.array((BK4, BN4), float32)
+ 
+    tid = cuda.threadIdx.x
+    # Each thread is responsible for one column and TM4 consecutive rows.
+    thread_col = tid % BN4               # column within the BN4-wide tile
+    thread_row = (tid // BN4) * TM4     # first row of this thread's strip
+ 
+    # Block origins in global C
+    block_row = cuda.blockIdx.y * BM4   # blockIdx.y → row
+    block_col = cuda.blockIdx.x * BN4   # blockIdx.x → col
+ 
+    # Per-thread register accumulators
+    acc = cuda.local.array(TM4, float32)
+    for i in range(TM4):
+        acc[i] = float32(0.0)
+ 
+    # Cooperative load indices (one element per thread per tile):
+    # A tile: BM4 x BK4 = 64*8 = 512 elements, 512 threads
+    #   thread tid loads As[tid // BK4, tid % BK4]
+    a_load_row = tid // BK4
+    a_load_col = tid % BK4
+ 
+    # B tile: BK4 x BN4 = 8*64 = 512 elements
+    #   thread tid loads Bs[tid // BN4, tid % BN4]
+    b_load_row = tid // BN4
+    b_load_col = tid % BN4
+ 
+    num_chunks = (K + BK4 - 1) // BK4
+    for chunk in range(num_chunks):
+        k_start = chunk * BK4
+ 
+        # Load A tile
+        ga_row = block_row + a_load_row
+        ga_col = k_start + a_load_col
+        if ga_row < M and ga_col < K:
+            As[a_load_row, a_load_col] = A[ga_row, ga_col]
+        else:
+            As[a_load_row, a_load_col] = float32(0.0)
+ 
+        # Load B tile
+        gb_row = k_start + b_load_row
+        gb_col = block_col + b_load_col
+        if gb_row < K and gb_col < N:
+            Bs[b_load_row, b_load_col] = B[gb_row, gb_col]
+        else:
+            Bs[b_load_row, b_load_col] = float32(0.0)
+ 
+        cuda.syncthreads()
+ 
+        # Accumulate: for each k in the chunk, broadcast Bs[dk, thread_col]
+        # and FMA into TM4 accumulators.
+        for dk in range(BK4):
+            b_val = Bs[dk, thread_col]
+            for tm in range(TM4):
+                acc[tm] += As[thread_row + tm, dk] * b_val
+ 
+        cuda.syncthreads()
+ 
+    # Write TM4 results to global C
+    for tm in range(TM4):
+        grow = block_row + thread_row + tm
+        gcol = block_col + thread_col
+        if grow < M and gcol < N:
+            C[grow, gcol] = acc[tm]
     return
 
 
