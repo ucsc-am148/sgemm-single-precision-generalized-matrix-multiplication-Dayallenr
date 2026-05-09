@@ -72,16 +72,12 @@ def sgemm_coalesced(A, B, C, M, N, K):
     and modulo by BLOCKSIZE. 
     Be careful which one indexes the column.
     """
-    # threadIdx.x runs 0..1023
-    # row_in_tile = threadIdx.x // BLOCKSIZE  (0..31)
-    # col_in_tile = threadIdx.x %  BLOCKSIZE  (0..31)
-    # Consecutive threads share the same row_in_tile and step in col_in_tile,
-    # so 32 consecutive threads write 32 consecutive columns → coalesced.
+    # col = tid % BLOCKSIZE so consecutive threads hit consecutive columns to coalesced
     row_in_tile = cuda.threadIdx.x // BLOCKSIZE
     col_in_tile = cuda.threadIdx.x % BLOCKSIZE
 
-    x = cuda.blockIdx.x * BLOCKSIZE + row_in_tile  # global row
-    y = cuda.blockIdx.y * BLOCKSIZE + col_in_tile  # global col
+    x = cuda.blockIdx.x * BLOCKSIZE + row_in_tile
+    y = cuda.blockIdx.y * BLOCKSIZE + col_in_tile
 
     if x < M and y < N:
         tmp = float32(0.0)
@@ -111,16 +107,18 @@ def sgemm_smem(A, B, C, M, N, K):
     (BK3, BN3) for Bs.
     Use 0.0 in the SMEM load when the global index is out of bounds.
     """
-    # Shared memory tiles
     As = cuda.shared.array((BM3, BK3), float32)
     Bs = cuda.shared.array((BK3, BN3), float32)
 
     # Each thread's position within the block tile
     tid = cuda.threadIdx.x
-    local_row = tid // BN3   # row within the BM3 x BN3 output tile
-    local_col = tid % BN3    # col within the BM3 x BN3 output tile
 
-    # Global row/col for this thread's output element
+    # row within the BM3 x BN3 output tile
+    local_row = tid // BN3
+
+    # col within the BM3 x BN3 output tile
+    local_col = tid % BN3
+
     global_row = cuda.blockIdx.x * BM3 + local_row
     global_col = cuda.blockIdx.y * BN3 + local_col
 
@@ -131,8 +129,6 @@ def sgemm_smem(A, B, C, M, N, K):
     for chunk in range(num_chunks):
         k_start = chunk * BK3
 
-        # --- Cooperatively load As[BM3, BK3] ---
-        # Thread (local_row, local_col) loads As[local_row, local_col]
         # since BM3 * BK3 == BM3 * BN3 == 1024 == block size, one-to-one.
         a_row = cuda.blockIdx.x * BM3 + local_row
         a_col = k_start + local_col
@@ -141,7 +137,6 @@ def sgemm_smem(A, B, C, M, N, K):
         else:
             As[local_row, local_col] = float32(0.0)
 
-        # --- Cooperatively load Bs[BK3, BN3] ---
         # Reuse local_row as the k-index within the chunk, local_col as the n-index.
         b_row = k_start + local_row
         b_col = cuda.blockIdx.y * BN3 + local_col
@@ -152,13 +147,12 @@ def sgemm_smem(A, B, C, M, N, K):
 
         cuda.syncthreads()
 
-        # --- Accumulate dot product ---
+        # Accumulate dot product
         for dk in range(BK3):
             acc += As[local_row, dk] * Bs[dk, local_col]
 
         cuda.syncthreads()
 
-    # Write result
     if global_row < M and global_col < N:
         C[global_row, global_col] = acc
 
@@ -185,37 +179,29 @@ def sgemm_1d_tile(A, B, C, M, N, K):
     Use cuda.local.array(TM4, float32) for the per-thread accumulator array.
     Initialize all entries to 0.0 before the K-loop.
     """
-    # blockIdx.x = column tile index, blockIdx.y = row tile index
-    # 512 threads, each owns TM4=8 rows in one column of the output tile
-    # thread layout within the block: 512 = (BM4 / TM4) * BN4 = 8 * 64
-    # thread_col = tid % BN4       (0..63)
-    # thread_row = tid // BN4 * TM4  — starting row of this thread's strip
  
     As = cuda.shared.array((BM4, BK4), float32)
     Bs = cuda.shared.array((BK4, BN4), float32)
  
     tid = cuda.threadIdx.x
-    # Each thread is responsible for one column and TM4 consecutive rows.
-    thread_col = tid % BN4               # column within the BN4-wide tile
-    thread_row = (tid // BN4) * TM4     # first row of this thread's strip
+
+    # blockIdx.x is cols, blockIdx.y is rows (axis swap from K3)
+    # each thread owns one column and TM4 consecutive rows in the output tile
+    thread_col = tid % BN4
+    thread_row = (tid // BN4) * TM4
  
     # Block origins in global C
-    block_row = cuda.blockIdx.y * BM4   # blockIdx.y → row
-    block_col = cuda.blockIdx.x * BN4   # blockIdx.x → col
+    block_row = cuda.blockIdx.y * BM4
+    block_col = cuda.blockIdx.x * BN4
  
-    # Per-thread register accumulators
+    # TM4 accumulators, one per row this thread owns
     acc = cuda.local.array(TM4, float32)
     for i in range(TM4):
         acc[i] = float32(0.0)
  
-    # Cooperative load indices (one element per thread per tile):
-    # A tile: BM4 x BK4 = 64*8 = 512 elements, 512 threads
-    #   thread tid loads As[tid // BK4, tid % BK4]
+   # 512 threads, 512 elements per tile, so one element per thread per load
     a_load_row = tid // BK4
     a_load_col = tid % BK4
- 
-    # B tile: BK4 x BN4 = 8*64 = 512 elements
-    #   thread tid loads Bs[tid // BN4, tid % BN4]
     b_load_row = tid // BN4
     b_load_col = tid % BN4
  
@@ -223,7 +209,7 @@ def sgemm_1d_tile(A, B, C, M, N, K):
     for chunk in range(num_chunks):
         k_start = chunk * BK4
  
-        # Load A tile
+        # Load A and B tiles
         ga_row = block_row + a_load_row
         ga_col = k_start + a_load_col
         if ga_row < M and ga_col < K:
@@ -231,7 +217,6 @@ def sgemm_1d_tile(A, B, C, M, N, K):
         else:
             As[a_load_row, a_load_col] = float32(0.0)
  
-        # Load B tile
         gb_row = k_start + b_load_row
         gb_col = block_col + b_load_col
         if gb_row < K and gb_col < N:
@@ -241,8 +226,7 @@ def sgemm_1d_tile(A, B, C, M, N, K):
  
         cuda.syncthreads()
  
-        # Accumulate: for each k in the chunk, broadcast Bs[dk, thread_col]
-        # and FMA into TM4 accumulators.
+        # broadcast one B value per dk step, FMA into all TM4 accumulators
         for dk in range(BK4):
             b_val = Bs[dk, thread_col]
             for tm in range(TM4):
@@ -250,7 +234,7 @@ def sgemm_1d_tile(A, B, C, M, N, K):
  
         cuda.syncthreads()
  
-    # Write TM4 results to global C
+    # Write TM4 results
     for tm in range(TM4):
         grow = block_row + thread_row + tm
         gcol = block_col + thread_col
@@ -283,12 +267,8 @@ def sgemm_2d_tile(A, B, C, M, N, K):
     As = cuda.shared.array((BM5, BK5), float32)
     Bs = cuda.shared.array((BK5, BN5), float32)
 
-    # 256 threads, TM5=8, TN5=8
-    # Thread layout within the output tile:
-    #   thread_col = tid % (BN5 // TN5)   (0..15)
-    #   thread_row = tid // (BN5 // TN5)  (0..15)
-    # Each thread owns a TM5 x TN5 sub-tile starting at
-    #   (thread_row * TM5, thread_col * TN5)
+    # each thread owns a TM5 x TN5 sub tile of the output
+    # 256 threads arranged as 16x16, each covering an 8x8 patch
     tid = cuda.threadIdx.x
     num_thread_cols = BN5 // TN5       # 16
     thread_col = tid % num_thread_cols
@@ -297,7 +277,7 @@ def sgemm_2d_tile(A, B, C, M, N, K):
     block_row = cuda.blockIdx.y * BM5
     block_col = cuda.blockIdx.x * BN5
 
-    # Register accumulators
+    # TM5 x TN5 accumulators for this threads output patch
     acc = cuda.local.array((TM5, TN5), float32)
     for tm in range(TM5):
         for tn in range(TN5):
@@ -306,23 +286,18 @@ def sgemm_2d_tile(A, B, C, M, N, K):
     reg_a = cuda.local.array(TM5, float32)
     reg_b = cuda.local.array(TN5, float32)
 
-    # Stride loop parameters for cooperative loads:
-    # A tile: BM5 * BK5 = 128*8 = 1024 elements, 256 threads → 4 each
-    # Load with stride = 256 threads, consecutive threads → consecutive cols
-    # Layout: thread tid loads row = tid // BK5, col = tid % BK5 for element 0
-    # then stride by (num_threads // BK5) rows each iteration.
+    # tile has 1024 elements but only 256 threads, so each thread loads 4
+    # striding in rows keeps consecutive threads on consecutive columns (coalesced)
     num_threads = (BM5 * BN5) // (TM5 * TN5)  # 256
-    # For A: inner index is column (BK5=8 wide), so stride in rows
-    a_inner_col = tid % BK5           # column within the BK5-wide A tile
-    a_inner_row = tid // BK5          # base row
-    a_row_stride = num_threads // BK5  # = 32 rows per stride step
+    a_inner_col = tid % BK5
+    a_inner_row = tid // BK5
+    a_row_stride = num_threads // BK5
 
-    # For B: inner index is column (BN5=128 wide), so stride in rows
-    b_inner_col = tid % BN5           # column within the BN5-wide B tile
-    b_inner_row = tid // BN5          # base row
-    b_row_stride = num_threads // BN5  # = 2 rows per stride step
+    b_inner_col = tid % BN5
+    b_inner_row = tid // BN5
+    b_row_stride = num_threads // BN5
 
-    # Number of loads per thread per chunk
+    # 4 elements per thread
     a_loads = (BM5 * BK5) // num_threads  # 4
     b_loads = (BK5 * BN5) // num_threads  # 4
 
@@ -330,7 +305,7 @@ def sgemm_2d_tile(A, B, C, M, N, K):
     for chunk in range(num_chunks):
         k_start = chunk * BK5
 
-        # Load A tile cooperatively (4 elements per thread)
+        # Load A tile
         for i in range(a_loads):
             local_row = a_inner_row + i * a_row_stride
             local_col = a_inner_col
@@ -341,7 +316,7 @@ def sgemm_2d_tile(A, B, C, M, N, K):
             else:
                 As[local_row, local_col] = float32(0.0)
 
-        # Load B tile cooperatively (4 elements per thread)
+        # Load B tile
         for i in range(b_loads):
             local_row = b_inner_row + i * b_row_stride
             local_col = b_inner_col
